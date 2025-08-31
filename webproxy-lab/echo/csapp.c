@@ -808,20 +808,24 @@ ssize_t rio_readn(int fd, void *usrbuf, size_t n)
  */
 /* $begin rio_writen */
 ssize_t rio_writen(int fd, void *usrbuf, size_t n) 
+// fd: 파일 디스크립터(파일/소켓/표준출력 등), usrbuf: 사용자 버퍼(보낼 데이터의 시작 주소)
+// n: 쓰고자 하는 전체 바이트 수,
 {
-    size_t nleft = n;
+    size_t nleft = n; // 아직 쓰지 못한 바이트 수
     ssize_t nwritten;
-    char *bufp = usrbuf;
+    char *bufp = usrbuf; // 현재 쓰기 시작할 메모리 위치
 
     while (nleft > 0) {
 	if ((nwritten = write(fd, bufp, nleft)) <= 0) {
 	    if (errno == EINTR)  /* Interrupted by sig handler return */
+        //시그널 때문에 write 중단
 		nwritten = 0;    /* and call write() again */
+        //다시 시도하도록 함
 	    else
 		return -1;       /* errno set by write() */
 	}
-	nleft -= nwritten;
-	bufp += nwritten;
+	nleft -= nwritten; // 남은 데이터 줄이기
+	bufp += nwritten; // 다음 위치로 이동
     }
     return n;
 }
@@ -904,12 +908,17 @@ ssize_t rio_readnb(rio_t *rp, void *usrbuf, size_t n)
  */
 /* $begin rio_readlineb */
 ssize_t rio_readlineb(rio_t *rp, void *usrbuf, size_t maxlen) 
+//rp: rio_t 구조체 포인터 (내부 버퍼 상태 + FD 포함)
 {
     int n, rc;
     char c, *bufp = usrbuf;
 
     for (n = 1; n < maxlen; n++) { 
+        //n은 현재까지 읽은 바이트 수(NULL 종료 고려 -> 최대 maxlen -1 만 저장
+        //한 글자씩 읽기 위해 루프를 돎
         if ((rc = rio_read(rp, &c, 1)) == 1) {
+            // 내부 버퍼에서 rio_read를 호출해 1바이트를 가져옴
+            // 성공하면 usrbuf에 저장 후 포인터 이동
 	    *bufp++ = c;
 	    if (c == '\n') {
                 n++;
@@ -983,40 +992,45 @@ ssize_t Rio_readlineb(rio_t *rp, void *usrbuf, size_t maxlen)
  */
 /* $begin open_clientfd */
 int open_clientfd(char *hostname, char *port) {
+    //특정 호스트(hostname)와 포트(port)에 연결된 소켓 디스크립터를 반환한다.
+    //성공하면 clientfd(양의 정수), 실패하면 -1 또는 -2를 반환.
     int clientfd, rc;
     struct addrinfo hints, *listp, *p;
 
     /* Get a list of potential server addresses */
     memset(&hints, 0, sizeof(struct addrinfo));
-    hints.ai_socktype = SOCK_STREAM;  /* Open a connection */
-    hints.ai_flags = AI_NUMERICSERV;  /* ... using a numeric port arg. */
-    hints.ai_flags |= AI_ADDRCONFIG;  /* Recommended for connections */
+    hints.ai_socktype = SOCK_STREAM;  /* Open a connection */ //TCP 연결
+    hints.ai_flags = AI_NUMERICSERV;  /* ... using a numeric port arg. */ //포트를 숫자로 해석
+    hints.ai_flags |= AI_ADDRCONFIG;  /* Recommended for connections */ // 현재 환경에 맞는 주소 체계만
     if ((rc = getaddrinfo(hostname, port, &hints, &listp)) != 0) {
+    //getaddinfo는 문자열로 된 hostname, port를 실제 소켓 주소 구조체 리스트(addinfo linked list)로 변환한다.
         fprintf(stderr, "getaddrinfo failed (%s:%s): %s\n", hostname, port, gai_strerror(rc));
-        return -2;
+        return -2; //실패 시 -2 리턴
     }
   
     /* Walk the list for one that we can successfully connect to */
     for (p = listp; p; p = p->ai_next) {
         /* Create a socket descriptor */
+        // socket()으로 소켓 생성 시도
         if ((clientfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0) 
-            continue; /* Socket failed, try the next */
+            continue; /* 소켓 생성 실패하면 다음 주소 후보 */
 
-        /* Connect to the server */
+        /* Connect로 서버에 연결 시도 */
         if (connect(clientfd, p->ai_addr, p->ai_addrlen) != -1) 
-            break; /* Success */
+            break; /* 연결 성공 */
         if (close(clientfd) < 0) { /* Connect failed, try another */  //line:netp:openclientfd:closefd
             fprintf(stderr, "open_clientfd: close failed: %s\n", strerror(errno));
-            return -1;
+            return -1; // 연결 실패 시 소켓 닫고 다음주소로 이동
         } 
     } 
 
     /* Clean up */
     freeaddrinfo(listp);
-    if (!p) /* All connects failed */
-        return -1;
-    else    /* The last connect succeeded */
-        return clientfd;
+    //getaddrinfo로 할당된 메모리 반드시 freeaddrinfo로 해제
+    if (!p) /* All connects failed */ //모든 연결 실패
+        return -1; //성공한 연결이 없으면 -1
+    else    /* The last connect succeeded */ //마지막 성공한 소켓 fd 반환
+        return clientfd; // 연결 성공시 clientfd(연결 성공한 소켓 디스크립터) 리턴
 }
 /* $end open_clientfd */
 
@@ -1030,19 +1044,24 @@ int open_clientfd(char *hostname, char *port) {
  */
 /* $begin open_listenfd */
 int open_listenfd(char *port) 
+// 입력: port -> 서버가 요청을 받을 포트 번호(문자열: 예:"8080")
+// 출력: 리스닝 소켓의 파일 디스크립터(성공 시), 또는 음수 값(실패 시)
 {
     struct addrinfo hints, *listp, *p;
     int listenfd, rc, optval=1;
 
     /* Get a list of potential server addresses */
     memset(&hints, 0, sizeof(struct addrinfo));
-    hints.ai_socktype = SOCK_STREAM;             /* Accept connections */
-    hints.ai_flags = AI_PASSIVE | AI_ADDRCONFIG; /* ... on any IP address */
-    hints.ai_flags |= AI_NUMERICSERV;            /* ... using port number */
+    //addrinfo 구조체를 이용해 소켓 설정 정보를 준비
+    hints.ai_socktype = SOCK_STREAM;             /* Accept connections */ //TCP 연결
+    hints.ai_flags = AI_PASSIVE | AI_ADDRCONFIG; /* ... on any IP address */ //현재 호스트의 모든 IP에서 접속 허용
+    hints.ai_flags |= AI_NUMERICSERV;            /* ... using port number */ //포트를 숫자로 사용
     if ((rc = getaddrinfo(NULL, port, &hints, &listp)) != 0) {
         fprintf(stderr, "getaddrinfo failed (port %s): %s\n", port, gai_strerror(rc));
         return -2;
     }
+    //getaddrinfo(NULL, port, ...) 호출로 바인딩 가능한 주소 후보 리스트를 얻음
+    //NULL을 넣은 것은 어떤 IP든 상관없이 현재 호스트의 모든 인터페이스에서 접속을 받겠다는 의미
 
     /* Walk the list for one that we can bind to */
     for (p = listp; p; p = p->ai_next) {
@@ -1050,12 +1069,13 @@ int open_listenfd(char *port)
         if ((listenfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0) 
             continue;  /* Socket failed, try the next */
 
-        /* Eliminates "Address already in use" error from bind */
+        /* Eliminates "Address already in use" error from bind */ //에러 방지
         setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR,    //line:netp:csapp:setsockopt
                    (const void *)&optval , sizeof(int));
 
         /* Bind the descriptor to the address */
         if (bind(listenfd, p->ai_addr, p->ai_addrlen) == 0)
+        //소켓을 주소에 바인딩
             break; /* Success */
         if (close(listenfd) < 0) { /* Bind failed, try the next */
             fprintf(stderr, "open_listenfd close failed: %s\n", strerror(errno));
@@ -1065,12 +1085,14 @@ int open_listenfd(char *port)
 
 
     /* Clean up */
-    freeaddrinfo(listp);
+    freeaddrinfo(listp); // getaddrinfo로 얻은 메모리 해제
     if (!p) /* No address worked */
         return -1;
 
     /* Make it a listening socket ready to accept connection requests */
     if (listen(listenfd, LISTENQ) < 0) {
+        //listen() 호출로 리스닝 소켓으로 변환
+        //LISTENQ는 커널이 대기열에 넣을 수 있는 연결 요청의 개수(보통 1024)
         close(listenfd);
 	return -1;
     }
