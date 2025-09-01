@@ -11,7 +11,7 @@
 void doit(int fd);
 void read_requesthdrs(rio_t *rp);
 int parse_uri(char *uri, char *filename, char *cgiargs);
-void serve_static(int fd, char *filename, int filesize);
+void serve_static(int fd, char *filename, int filesize, int send_body);
 void get_filetype(char *filename, char *filetype);
 void serve_dynamic(int fd, char *filename, char *cgiargs);
 void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg);
@@ -54,12 +54,78 @@ int main(int argc, char **argv)
   }
 }
 //######################################################################################################################################################
+// //이게 원본
+// void doit(int fd){ 
+//   int is_static;
+//   struct stat sbuf;
+//   char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
+//   char filename[MAXLINE], cgiargs[MAXLINE];
+//   rio_t rio;
+
+//   Rio_readinitb(&rio, fd);
+//   Rio_readlineb(&rio, buf, MAXLINE);
+//   printf("Request headers:\n");
+//   printf("%s", buf);
+//   sscanf(buf, "%s %s %s", method, uri, version);
+//   //fd(클라이언트 소켓)를 리오 버퍼와 연결하고 첫 줄(요청 라인)을 읽는다
+//   //요청 라인은 "GET /path?query HTTP/1.1" 형태
+//   //method, uri, version에 나눠 담는다
+//   //디버깅용으로 요청 라인을 출력한다
+//   if(strcasecmp(method, "GET")){
+//     clienterror(fd, method, "501", "Not implemented", "Tiny does not implement this method");
+//     return;
+//   }
+//   //대소문자 무시 비교로 GET이 아니면 501 Not Implemented 반환 후 종료(HEAD, POST 등은 미구현) - 메소드 검사(GET만 지원)
+//   read_requesthdrs(&rio);
+//   //남은 헤더들을 읽어버리지만 별도 해석은 안함 - 요청 헤더 스킵(읽기)
+
+//   is_static = parse_uri(uri, filename, cgiargs);
+//   //URI 해석 -> 정적/동적 분기
+//   //parse_uri가 uri를 파일 경로(filename)와 CGI 인자(cgiargs)로 분리
+//   //정적이면 is_static = 1, 동적(CGI)이면 0
+//     //예) /index.html -> 정적, /cgi-bin/adder?15000&213 -> 동적(+cgiargs = '15000&213')
+//   if(stat(filename, &sbuf) < 0){
+//     clienterror(fd, filename, "404", "Not found", "Tiny couldn't find this file");
+//     return;
+//   }
+//   //파일 존재/메타데이터 확인
+//   //파일 시스템에서 filename의 상태를 확인
+//   //없거나 접근 불가면 404 Not Found
+
+//   if(is_static){
+//     if(!(S_ISREG(sbuf.st_mode)) || !(S_IRUSR & sbuf.st_mode)){
+//       clienterror(fd, filename, "403", "Forbidden", "Tiny couldn't read the file");
+//       return;
+//     }
+//     serve_static(fd, filename, sbuf.st_size);
+//   }
+//   //정적 컨텐츠
+//   //일반 파일인지(S_ISREG)와 소유자 읽기 권한(S_IRUSR) 확인
+//   //조건 불만족 -> 403 Forbidden
+//   //OK면 serve_static이 헤더(Content-Type, Content-Length)와 파일을 보냄
+
+//   else{
+//     if(!(S_ISREG(sbuf.st_mode)) || !(S_IXUSR & sbuf.st_mode)){
+//       clienterror(fd, filename, "403", "Forbidden", "Tiny couldn't run the CGI program");
+//       return;
+//     }
+//     serve_dynamic(fd, filename, cgiargs);
+//   }
+//   //동적 컨텐츠(CGI)
+//   //일반 파일인지와 실행 권한(S_IXUSR) 확인
+//   //OK면 serve_dynamic이 fork/exec로 CGI 실행:
+//     //환경변수(QUERY_STRING 등) 세팅
+//     //표준출력 <-> 소켓으로 리다이렉션
+//     //CGI가 직접 Content - type, Content - length 헤더와 본문을 출력
+// }
+//######################################################################################################################################################
 void doit(int fd){
   int is_static;
   struct stat sbuf;
   char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
   char filename[MAXLINE], cgiargs[MAXLINE];
   rio_t rio;
+  int send_body = 1;
 
   Rio_readinitb(&rio, fd);
   Rio_readlineb(&rio, buf, MAXLINE);
@@ -70,11 +136,15 @@ void doit(int fd){
   //요청 라인은 "GET /path?query HTTP/1.1" 형태
   //method, uri, version에 나눠 담는다
   //디버깅용으로 요청 라인을 출력한다
-  if(strcasecmp(method, "GET")){
+  if(strcasecmp(method, "GET") && strcasecmp(method, "HEAD")){
     clienterror(fd, method, "501", "Not implemented", "Tiny does not implement this method");
     return;
   }
-  //대소문자 무시 비교로 GET이 아니면 501 Not Implemented 반환 후 종료(HEAD, POST 등은 미구현) - 메소드 검사(GET만 지원)
+    //대소문자 무시 비교로 GET이 아니면 501 Not Implemented 반환 후 종료(HEAD, POST 등은 미구현) - 메소드 검사(GET만 지원)
+  if(!strcasecmp(method, "HEAD")){
+    send_body = 0;
+  }
+
   read_requesthdrs(&rio);
   //남은 헤더들을 읽어버리지만 별도 해석은 안함 - 요청 헤더 스킵(읽기)
 
@@ -96,7 +166,7 @@ void doit(int fd){
       clienterror(fd, filename, "403", "Forbidden", "Tiny couldn't read the file");
       return;
     }
-    serve_static(fd, filename, sbuf.st_size);
+    serve_static(fd, filename, sbuf.st_size, send_body);
   }
   //정적 컨텐츠
   //일반 파일인지(S_ISREG)와 소유자 읽기 권한(S_IRUSR) 확인
@@ -104,6 +174,10 @@ void doit(int fd){
   //OK면 serve_static이 헤더(Content-Type, Content-Length)와 파일을 보냄
 
   else{
+    if(!send_body){
+      clienterror(fd, filename, "501", "Not implemented", "Tiny does not implement HEAD for CGI");
+      return;
+    }
     if(!(S_ISREG(sbuf.st_mode)) || !(S_IXUSR & sbuf.st_mode)){
       clienterror(fd, filename, "403", "Forbidden", "Tiny couldn't run the CGI program");
       return;
@@ -210,8 +284,8 @@ int parse_uri(char* uri, char* filename, char* cgiargs){
 }
 
 //######################################################################################################################################################
-void serve_static(int fd, char* filename, int filesize){
-
+void serve_static(int fd, char* filename, int filesize, int send_body){
+//int send body 추가함
   int srcfd;
   char* srcp, filetype[MAXLINE], buf[MAXLINE];
 
@@ -225,8 +299,11 @@ void serve_static(int fd, char* filename, int filesize){
   sprintf(buf, "%sContent-type: %s\r\n\r\n", buf, filetype); //MIME 타입
   Rio_writen(fd, buf, strlen(buf)); // 응답 헤더 전송
   // 마지막 빈 줄 \r\n로 헤더 종료 -> 바로 본문(파일 내용) 전송
-  printf("Response headers:\n");
-  printf("%s", buf);
+  // printf("Response headers:\n");
+  // printf("%s", buf);
+  // 위 2줄은 send_body 때문에 주석 처리한거임 
+
+  if(!send_body) return; //send_body에서만 사용
 
   srcfd = Open(filename, O_RDONLY, 0); //디스크 파일 열기
   // Open으로 읽기 전용 FD 획득
@@ -239,6 +316,45 @@ void serve_static(int fd, char* filename, int filesize){
   // 파일 내용을 소켓으로 전송
   Munmap(srcp, filesize); //매핑 해제
 }
+
+//######################################################################################################################################################
+// void serve_static(int fd, char* filename, int filesize){
+
+//   int srcfd;
+//   char* filebuf, filetype[MAXLINE], buf[MAXLINE];
+
+//   get_filetype(filename, filetype);
+//   // 파일 확장자를 보고 text/html, image/jpeg 같은 Content-Type을 채워 넣는다(MIME 타입 결정)
+//   sprintf(buf, "HTTP/1.0 200 OK\r\n"); // 상태줄
+//   // HTTP/1.0 200 OK: 성공 상태줄
+//   sprintf(buf, "%sServer: Tiny Web Server \r\n", buf);// 서버 식별(정보성)
+//   sprintf(buf, "%sConnection: close\r\n", buf); // 요청/응답 이후 연결을 끊겠다는 의미(HTTP/1.0 기본 동작과 일치)
+//   sprintf(buf, "%sContent-length: %d\r\n", buf, filesize); // 바디 길이를 정확히 명시(클라이언트가 언제까지 읽을지 판단)
+//   sprintf(buf, "%sContent-type: %s\r\n\r\n", buf, filetype); //MIME 타입
+//   Rio_writen(fd, buf, strlen(buf)); // 응답 헤더 전송
+//   // 마지막 빈 줄 \r\n로 헤더 종료 -> 바로 본문(파일 내용) 전송
+//   printf("Response headers:\n");
+//   printf("%s", buf);
+
+//   srcfd = Open(filename, O_RDONLY, 0); //디스크 파일 열기
+//   // Open으로 읽기 전용 FD 획득
+//   filebuf = (char*)malloc(filesize);
+//   if(!filebuf){
+//     Close(srcfd);
+//     return;
+//   }
+//   if(rio_readn(srcfd, filebuf, filesize) != filesize){
+//     free(filebuf);
+//     Close(srcfd);
+//     return;
+//   }
+  
+//   Close(srcfd); // FD는 바로 닫아도 됨(매핑이 유지함)
+//   // 매핑이 커널이 관리하는 페이지로 이어줌
+//   Rio_writen(fd, filebuf, filesize); //파일 내용(바디) 전송
+//   // 파일 내용을 소켓으로 전송
+//   free(filebuf); //해제
+// }
 
 //######################################################################################################################################################
 void get_filetype(char* filename, char* filetype){
