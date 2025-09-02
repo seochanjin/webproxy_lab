@@ -3,11 +3,31 @@
 #include <stdbool.h>
 #include <string.h>
 #include <strings.h>
+#include <pthread.h>
+#include <signal.h>
 
 /* Recommended max cache and object sizes */
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
 #define MAX_HEADERS 100
+
+//캐시
+#define KEYMAX (MAXLINE * 3)
+
+typedef struct cache_obj{
+  char key[KEYMAX];
+  char *data;
+  size_t size;
+  struct cache_obj *prev, *next;
+} cache_obj_t;
+
+typedef struct {
+  cache_obj_t *head, *tail;
+  size_t total;
+  pthread_rwlock_t rwlock;
+} cache_t;
+
+static cache_t g_cache;
 
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr =
@@ -23,6 +43,16 @@ static int forward_request_to_origin(
   const char* host, const char* port, const char* path,
   char header[][MAXLINE], int num_headers);
 
+  // 동시성
+static void* worker(void* arg); //스레드 함수
+
+ // 캐시
+static void dll_push_front(cache_obj_t *o);
+static void dll_remove(cache_obj_t *o);
+static void cache_init(void);
+static cache_obj_t* cache_find_unlocked(const char* key);
+static int cache_lookup(const char* key, char** out, size_t* out_sz);
+static void cache_insert(const char *key, const char* data, size_t sz);
 //######################################################################################################################################################
 /*
 * 명령행에서 포트를 받고 그 포트로 리스닝 소켓을 연다.
@@ -31,7 +61,7 @@ static int forward_request_to_origin(
 */
 int main(int argc, char** argv){
   
-  int listenfd, connfd;
+  int listenfd, connfd, *connfdp;
   socklen_t clientlen;
   struct sockaddr_storage clientaddr;
 
@@ -41,19 +71,32 @@ int main(int argc, char** argv){
     exit(1);
   }
 
+  signal(SIGPIPE, SIG_IGN); // write 중 상대가 끊어도 죽지 않게
+  cache_init();
+
   listenfd = Open_listenfd(argv[1]);
   //Open_listenfd는 socket -> bind -> listen까지 해결해주는 헬퍼(에러 처리 포함)
   //여기서 만들어진 소켓은 수동 대기(listening) 상태
 
   while(1){
     clientlen = sizeof(clientaddr);
-    connfd = Accept(listenfd, (SA*)&clientaddr, &clientlen);
-    //Accept로 새 TCP 연결을 수락하여 연결 전용 소켓(connfd)를 획득
-    handle_client(connfd);
-    //전용 소켓을 handle_client에 넘겨 요청 파싱/원서버로 포워딩/응답 릴레이를 수행
-    Close(connfd);
-    //끝나면 반드시 Close(connfd)로 정리(리소스 누수 방지)
-    //리스닝 소켓(listenfd)은 루프 동안 계속 열려있음
+    connfdp = Malloc(sizeof(int));
+    *connfdp = Accept(listenfd, (SA*)&clientaddr, &clientlen);
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, worker, connfdp);
+    pthread_detach(tid);
+    // 주의: 이제 main에서 Close(connfd) 하지 않는다(스레드가 담음)
+    /*
+     * 기존에 동시성 하기 전에 사용하던 것
+     * connfd = Accept(listenfd, (SA*)&clientaddr, &clientlen);
+     * //Accept로 새 TCP 연결을 수락하여 연결 전용 소켓(connfd)를 획득
+     * handle_client(connfd);
+     * //전용 소켓을 handle_client에 넘겨 요청 파싱/원서버로 포워딩/응답 릴레이를 수행
+     * Close(connfd);
+     * //끝나면 반드시 Close(connfd)로 정리(리소스 누수 방지)
+     * //리스닝 소켓(listenfd)은 루프 동안 계속 열려있음
+    */
   }
 }
 
@@ -307,6 +350,16 @@ static int forward_request_to_origin(
   const char* host, const char* port, const char* path,
   char header[][MAXLINE], int num_headers)
   {
+    char cache_key[KEYMAX];
+    snprintf(cache_key, sizeof(cache_key), "%s:%s%s", host, port, path);
+
+    char* cached = NULL; size_t cached_sz = 0;
+    if(cache_lookup(cache_key, &cached, &cached_sz)){
+      Rio_writen(clientfd, cached, cached_sz);
+      Free(cached);
+      return 0;
+    }
+
     // 원서버에 TCP 연결
     int serverfd = Open_clientfd(host, port);
     if(serverfd < 0) return -1;
@@ -377,34 +430,144 @@ static int forward_request_to_origin(
 
     char buf[MAXBUF];
     ssize_t m;
-    while((m = Rio_readnb(&s_rio, buf, sizeof(buf))) > 0)
-      Rio_writen(clientfd, buf, m);
+
+    char* obj = Malloc(MAX_OBJECT_SIZE);
+    size_t obj_sz = 0;
+    int cacheable = 1;
+
+    while((m = Rio_readnb(&s_rio, buf, sizeof(buf))) > 0){
+      if(rio_writen(clientfd, buf, m) < 0){ 
+        cacheable = 0;
+        break;
+      } 
+    //EPIPE 등 발생 시 해당 연결만 종료
     // 원서버 응답을 클라이언트로 그대로 중계
     // 원서버 응답(헤더+바디)을 그대로 스트리밍 복사
     // 위에서 Connection: close를 강제했기 때문에 원서버가 응답을 보내고 연결을 닫으면(EOF) 루프가 종료
     // -> 응답 끝을 쉽게 인지한다.
     
-    Close(serverfd);
-    return 0;
-    // 원서버 소켓 닫고 종료(클라이언트 소켓은 바깥 handle_client에서 닫음)
+    if(cacheable){
+      if(obj_sz + (size_t)m <= MAX_OBJECT_SIZE){
+        memcpy(obj + obj_sz, buf, (size_t)m);
+        obj_sz += (size_t)m;
+      }
+      else{
+        cacheable = 0;
+      }
+    }
+
+    // Close(serverfd);
+    // return 0;
+    // // 원서버 소켓 닫고 종료(클라이언트 소켓은 바깥 handle_client에서 닫음)
+  }
+  if(cacheable && obj_sz > 0){
+    cache_insert(cache_key, obj, obj_sz);
+  }
+  Free(obj);
+  
+  Close(serverfd);
+  return 0;
+}
+
+//######################################################################################################################################################
+static void* worker(void* arg){
+  int connfd = *((int*)arg);
+  Free(arg);
+
+  handle_client(connfd);
+
+  Close(connfd);
+  return NULL;
+}
+
+//######################################################################################################################################################
+static void dll_push_front(cache_obj_t *o){
+  o -> prev = NULL;
+  o -> next = g_cache.head;
+  if(g_cache.head) g_cache.head -> prev = o;
+  g_cache.head = o;
+  if(!g_cache.tail) g_cache.tail = o;
+}
+
+//######################################################################################################################################################
+static void dll_remove(cache_obj_t *o){
+  if(o -> prev) o -> prev -> next = o -> next; else g_cache.head = o -> next;
+  if(o -> next) o -> next -> prev = o -> prev; else g_cache.tail = o -> prev;
+  o -> prev = o -> next = NULL;
+}
+
+//######################################################################################################################################################
+static void cache_init(void){
+  memset(&g_cache, 0, sizeof(g_cache));
+  pthread_rwlock_init(&g_cache.rwlock, NULL);
+}
+
+//######################################################################################################################################################
+static cache_obj_t* cache_find_unlocked(const char* key){
+  for(cache_obj_t* p = g_cache.head; p; p = p -> next)
+    if(strcmp(p -> key, key) == 0) return p;
+  return NULL;
+}
+
+//######################################################################################################################################################
+static int cache_lookup(const char* key, char** out, size_t* out_sz){
+  int hit = 0;
+  cache_obj_t* obj = NULL;
+
+  pthread_rwlock_rdlock(&g_cache.rwlock);
+  obj = cache_find_unlocked(key);
+  if(obj){
+    *out_sz = obj -> size;
+    *out = Malloc(obj -> size);
+    memcpy(*out, obj -> data, obj -> size);
+    hit = 1;
+  }
+  pthread_rwlock_unlock(&g_cache.rwlock);
+
+  if(hit){
+    pthread_rwlock_wrlock(&g_cache.rwlock);
+    obj = cache_find_unlocked(key);
+    if(obj && obj != g_cache.head){
+      dll_remove(obj);
+      dll_push_front(obj);
+    }
+    pthread_rwlock_unlock(&g_cache.rwlock);
+  }  
+  return hit;
+}
+
+//######################################################################################################################################################
+static void cache_insert(const char *key, const char *data, size_t sz){
+  if(sz > MAX_OBJECT_SIZE) return;
+
+  pthread_rwlock_wrlock(&g_cache.rwlock);
+
+  cache_obj_t* ex = cache_find_unlocked(key);
+  if(ex){
+    dll_remove(ex);
+    g_cache.total -= ex -> size;
+    Free(ex -> data);
+    Free(ex);
   }
 
-//######################################################################################################################################################
+  while(g_cache.total + sz > MAX_CACHE_SIZE && g_cache.tail){
+    cache_obj_t* v = g_cache.tail;
+    dll_remove(v);
+    g_cache.total -= v -> size;
+    Free(v -> data);
+    Free(v);
+  }
 
+  cache_obj_t* o = Malloc(sizeof(cache_obj_t));
+  strncpy(o -> key, key, sizeof(o -> key) - 1); o -> key[sizeof(o -> key) - 1] = '\0';
+  o -> data = Malloc(sz);
+  memcpy(o -> data, data, sz);
+  o -> size = sz;
+  o -> prev = o -> next = NULL;
+  dll_push_front(o);
+  g_cache.total += sz;
 
-//######################################################################################################################################################
-
-
-//######################################################################################################################################################
-
-
-//######################################################################################################################################################
-
-
-//######################################################################################################################################################
-
-
-//######################################################################################################################################################
-
+  pthread_rwlock_unlock(&g_cache.rwlock);
+}
 
 //######################################################################################################################################################
